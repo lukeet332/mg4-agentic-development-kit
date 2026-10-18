@@ -30,6 +30,9 @@ public final class MainActivity extends Activity {
     private TextView pairCode;
     private TextView pairStatus;
     private TextView clients;
+    private LinearLayout clientsList;
+    private String clientsSignature = "";
+    private final java.util.Map<String, TextView> clientLabels = new java.util.HashMap<>();
     private EditText port;
     private Button toggle;
     private final Handler handler = new Handler(Looper.getMainLooper());
@@ -50,6 +53,18 @@ public final class MainActivity extends Activity {
         pairCode = findViewById(R.id.pair_code);
         pairStatus = findViewById(R.id.pair_status);
         clients = findViewById(R.id.clients);
+        clientsList = findViewById(R.id.clients_list);
+        findViewById(R.id.revoke_all).setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                int n = 0;
+                for (Pairing.Client c : Pairing.clients(MainActivity.this)) {
+                    if (Pairing.revoke(MainActivity.this, c.id)) n++;
+                }
+                clientsSignature = "";
+                toast(n == 0 ? "No devices to revoke" : "Revoked " + n + " device(s)");
+                refresh();
+            }
+        });
         port = findViewById(R.id.port);
         toggle = findViewById(R.id.toggle);
         Button apply = findViewById(R.id.apply);
@@ -151,21 +166,69 @@ public final class MainActivity extends Activity {
         }
 
         List<Pairing.Client> list = Pairing.clients(this);
-        if (list.isEmpty()) {
-            clients.setText("No paired devices yet.");
+        clients.setText(list.isEmpty() ? "No paired devices yet." : "");
+        // Rebuild the rows only when something actually changed, so the revoke
+        // buttons survive the one-second refresh tick.
+        StringBuilder sig = new StringBuilder();
+        for (Pairing.Client c : list) {
+            sig.append(c.id).append(':').append(c.name).append(';');
+        }
+        if (!sig.toString().equals(clientsSignature)) {
+            clientsSignature = sig.toString();
+            rebuildClientRows(list);
         } else {
-            StringBuilder b = new StringBuilder();
+            // Same devices: refresh the labels in place. Rebuilding the rows on every
+            // lastSeen change destroyed the button under the user's finger mid-tap,
+            // so a tap on Revoke could never complete.
             for (Pairing.Client c : list) {
-                b.append("• ").append(c.name).append("  [").append(c.id).append("]")
-                        .append("\n   last seen ").append(c.lastSeen == 0 ? "never" : Api.iso(c.lastSeen))
-                        .append(c.lastIp.isEmpty() ? "" : " from " + c.lastIp)
-                        .append("\n");
+                TextView label = clientLabels.get(c.id);
+                if (label != null) label.setText(clientLabel(c));
             }
-            clients.setText(b.toString().trim());
         }
         if (Rollback.pending(this)) {
             clients.append("\n\nUpdate pending confirmation until " + Api.iso(Rollback.deadline(this))
                     + " - POST /selfupdate/confirm to keep it.");
+        }
+    }
+
+    /** One row per paired device: who it is, when it was last seen, and Revoke. */
+    private String clientLabel(Pairing.Client c) {
+        return c.name + "  [" + c.id + "]\n"
+                + "token " + (c.token.length() > 8 ? c.token.substring(0, 8) : c.token) + "…"
+                + "  ·  last seen " + (c.lastSeen == 0 ? "never" : Api.iso(c.lastSeen))
+                + (c.lastIp.isEmpty() ? "" : " from " + c.lastIp);
+    }
+
+    private void rebuildClientRows(List<Pairing.Client> list) {
+        clientsList.removeAllViews();
+        clientLabels.clear();
+        for (final Pairing.Client c : list) {
+            LinearLayout row = new LinearLayout(this);
+            row.setOrientation(LinearLayout.HORIZONTAL);
+            row.setPadding(0, 8, 0, 8);
+            row.setGravity(android.view.Gravity.CENTER_VERTICAL);
+
+            TextView label = new TextView(this);
+            label.setTextSize(12f);
+            label.setText(clientLabel(c));
+            clientLabels.put(c.id, label);
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                    0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+            label.setLayoutParams(lp);
+            row.addView(label);
+
+            Button revoke = new Button(this);
+            revoke.setText("Revoke");
+            revoke.setOnClickListener(new View.OnClickListener() {
+                @Override public void onClick(View v) {
+                    boolean ok = Pairing.revoke(MainActivity.this, c.id);
+                    clientsSignature = "";
+                    toast(ok ? "Revoked " + c.name : "Already gone");
+                    refresh();
+                }
+            });
+            row.addView(revoke);
+            clientsList.addView(row);
         }
     }
 

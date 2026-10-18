@@ -151,6 +151,6 @@ jobs:
             `android.uid.system`. Anyone can reproduce this signature — the security
             boundary is the pairing token, not the certificate.
           files: |
-            dist/*.apk
-            dist/*.sha256
+            dist/AgenticDevelopmentKit-*.apk
+            dist/AgenticDevelopmentKit-*.apk.sha256
           generate_release_notes: true

@@ -143,6 +143,19 @@
             android:textSize="12sp"
             android:text="No paired devices yet." />
 
+        <LinearLayout
+            android:id="@+id/clients_list"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:paddingTop="4dp" />
+
+        <Button
+            android:id="@+id/revoke_all"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Revoke all devices" />
+
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"

@@ -70,7 +70,20 @@ The channel is a system-level shell on a car, so it is not open by default:
    ```
 
 3. Every later call sends `X-ADK-Token: <token>`. Tokens are per-device and revocable
-   (`GET /clients`, `POST /pair/revoke`).
+   (`GET /clients`, `POST /pair/revoke`, or the **Revoke** button beside each device in
+   the car app, plus **Revoke all devices**).
+
+**Pairing is sticky.** It is done once per device, not once per drive: tokens live in the
+app's private storage and are reloaded at every start, so they survive reboots, app
+restarts and ADK self-updates. Verified on the rig: pair → reboot the head unit → the
+channel comes back on its own (`BOOT_COMPLETED`) and the paired token still answers
+`GET /exec?cmd=id` with `uid=1000(system)`, with no re-pairing. A token only stops
+working when you revoke it, uninstall ADK, clear its data, or install a build signed with
+a different key (which forces an uninstall first).
+
+After pairing there are **no prompts in the car** for anything an agent asks: install,
+exec, input, settings and reboot all run on the token alone. The car screen only shows
+status (and the pairing code, once, when you are adding a device).
 
 The **master token** (full control, never handed out over the network) is shown in the
 app and mirrored to `/data/local/tmp/adk.token` and `/sdcard/adk.token` for adb users.
