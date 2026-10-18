@@ -104,10 +104,13 @@ jobs:
         id: sign
         run: |
           set -euo pipefail
+          mkdir -p dist
           BT="$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)"
           name='${{ steps.v.outputs.name }}'
           out="AgenticDevelopmentKit-${name}.apk"
-          "$BT/zipalign" -f 4 app/build/outputs/apk/release/app-release-unsigned.apk dist/aligned.apk
+          UNSIGNED=app/build/outputs/apk/release/app-release-unsigned.apk
+          ls -l "$UNSIGNED"
+          "$BT/zipalign" -f 4 "$UNSIGNED" dist/aligned.apk
           "$BT/apksigner" sign \
             --key signing/platform.pk8 \
             --cert signing/platform.x509.pem \
