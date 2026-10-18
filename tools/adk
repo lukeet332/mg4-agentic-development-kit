@@ -1,0 +1,1362 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""adk - command line driver for the Agentic Development Kit (ADK) car head unit app.
+
+ADK is a platform-signed system app on an MG4 head unit that serves an HTTP control
+API (default port 8787) over the car hotspot or home Wi-Fi.  This CLI is the agent's
+steering wheel: every endpoint of the API is reachable through `adk call`, and the
+common ones have a verb of their own.
+
+    adb forward tcp:8787 tcp:8787      # on the rig, then the default URL just works
+    adk pair 123456 --name mac-agent   # code shown on the car screen
+    adk health
+    adk exec id
+    adk install app-release.apk && adk logs --grep FATAL
+    adk shot /tmp/car.png && adk ui
+
+Everything is token authenticated.  The token comes from --token, $ADK_TOKEN or
+~/.adk/token (written by `adk pair`).  Non-2xx responses exit 1 and print the status
+and body to stderr; usage/config problems exit 2.
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+
+VERSION = "0.1.0"
+DEFAULT_URL = "http://127.0.0.1:8787"
+DEFAULT_TIMEOUT = 60.0
+TOKEN_DIR = os.path.join(os.path.expanduser("~"), ".adk")
+TOKEN_FILE = os.path.join(TOKEN_DIR, "token")
+MASTER_MIRROR = "/data/local/tmp/adk.token"
+
+EXIT_OK = 0
+EXIT_REMOTE = 1
+EXIT_USAGE = 2
+
+PAIR_HINT = (
+    "adk: this endpoint needs a token.\n"
+    "adk:   - the car app shows a 6-digit code:  adk pair <code>\n"
+    "adk:   - or read the master token over adb: adb shell cat " + MASTER_MIRROR + "\n"
+    "adk:     then:                              adk use <token>\n"
+)
+
+# --------------------------------------------------------------------- tiny utils
+
+
+def die(message, code=EXIT_USAGE):
+    """Print a fatal message to stderr and exit."""
+    sys.stderr.write(message.rstrip("\n") + "\n")
+    raise SystemExit(code)
+
+
+def info(ctx, message):
+    """Informational line on stderr, silenced by --quiet."""
+    if not ctx.quiet:
+        sys.stderr.write(message.rstrip("\n") + "\n")
+
+
+def try_json(text):
+    """Parse text as JSON if it plausibly is JSON, else None."""
+    s = text.strip()
+    if not s or s[0] not in "{[":
+        return None
+    try:
+        return json.loads(s)
+    except ValueError:
+        return None
+
+
+def print_json(obj):
+    sys.stdout.write(json.dumps(obj, indent=2, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+
+def print_text(text):
+    if text and not text.endswith("\n"):
+        text += "\n"
+    sys.stdout.write(text)
+    sys.stdout.flush()
+
+
+def looks_binary(data):
+    if b"\x00" in data[:8192]:
+        return True
+    try:
+        data[:8192].decode("utf-8")
+        return False
+    except UnicodeDecodeError:
+        return True
+
+
+BINARY_PREFIXES = ("image/", "video/", "audio/")
+BINARY_TYPES = (
+    "application/octet-stream",
+    "application/zip",
+    "application/vnd.android.package-archive",
+)
+
+
+def is_binary_ct(content_type):
+    ct = (content_type or "").split(";")[0].strip().lower()
+    if not ct:
+        return None
+    if ct.startswith("text/"):
+        return False
+    if ct in ("application/json", "application/xml", "application/javascript"):
+        return False
+    if ct.endswith("+json") or ct.endswith("+xml"):
+        return False
+    if ct.startswith(BINARY_PREFIXES) or ct in BINARY_TYPES:
+        return True
+    return False
+
+
+def suffix_for(content_type):
+    ct = (content_type or "").split(";")[0].strip().lower()
+    return {
+        "image/png": ".png",
+        "image/jpeg": ".jpg",
+        "image/webp": ".webp",
+        "video/mp4": ".mp4",
+        "application/zip": ".zip",
+    }.get(ct, ".bin")
+
+
+def write_bytes(path, data):
+    with open(path, "wb") as fh:
+        fh.write(data)
+    return len(data)
+
+
+# ------------------------------------------------------------------ token store
+
+
+def read_stored_token():
+    try:
+        with open(TOKEN_FILE, "r") as fh:
+            return fh.read().strip() or None
+    except OSError:
+        return None
+
+
+def save_token(token):
+    token = token.strip()
+    if not token:
+        die("adk: refusing to store an empty token", EXIT_USAGE)
+    try:
+        os.makedirs(TOKEN_DIR, mode=0o700, exist_ok=True)
+        fd = os.open(TOKEN_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(token + "\n")
+        os.chmod(TOKEN_FILE, 0o600)
+    except OSError as exc:
+        die("adk: cannot write %s: %s" % (TOKEN_FILE, exc), EXIT_USAGE)
+    return TOKEN_FILE
+
+
+def resolve_token(cli_token):
+    """Return (token, source) with source naming where the token came from."""
+    if cli_token:
+        return cli_token.strip(), "--token"
+    env = os.environ.get("ADK_TOKEN")
+    if env and env.strip():
+        return env.strip(), "ADK_TOKEN"
+    stored = read_stored_token()
+    if stored:
+        return stored, TOKEN_FILE
+    return None, None
+
+
+def normalize_url(url):
+    url = (url or "").strip() or DEFAULT_URL
+    if not re.match(r"^https?://", url, re.I):
+        url = "http://" + url
+    return url.rstrip("/")
+
+
+# ------------------------------------------------------------------ http layer
+
+
+class Ctx(object):
+    def __init__(self, url, token, token_source, timeout, quiet):
+        self.url = url
+        self.token = token
+        self.token_source = token_source
+        self.timeout = timeout if timeout else DEFAULT_TIMEOUT
+        self.quiet = quiet
+
+    def headers(self, token_required=True, extra=None):
+        hdrs = {"Accept": "*/*", "User-Agent": "adk-cli/" + VERSION}
+        if token_required:
+            if not self.token:
+                sys.stderr.write(PAIR_HINT)
+                raise SystemExit(EXIT_USAGE)
+            hdrs["X-ADK-Token"] = self.token
+        if extra:
+            hdrs.update(extra)
+        return hdrs
+
+
+class Response(object):
+    __slots__ = ("status", "headers", "data", "url", "content_type")
+
+    def __init__(self, status, headers, data, url):
+        self.status = status
+        self.headers = headers
+        self.data = data
+        self.url = url
+        self.content_type = headers.get("Content-Type", "") or ""
+
+
+def build_url(base, path, params=None):
+    url = base.rstrip("/") + path
+    if params:
+        clean = [(k, v) for k, v in params.items() if v is not None]
+        if clean:
+            url += ("&" if "?" in url else "?") + urllib.parse.urlencode(clean, doseq=True)
+    return url
+
+
+def fail_http(method, url, code, reason, payload):
+    text = payload.decode("utf-8", "replace").strip()
+    if len(text) > 2000:
+        text = text[:2000] + "\n... (truncated)"
+    sys.stderr.write("adk: HTTP %s %s - %s %s\n" % (code, reason, method, url))
+    if text:
+        sys.stderr.write(text + "\n")
+    if code == 401:
+        sys.stderr.write(PAIR_HINT)
+    raise SystemExit(EXIT_REMOTE)
+
+
+def fail_net(url, err):
+    reason = getattr(err, "reason", err)
+    sys.stderr.write("adk: cannot reach ADK at %s\n" % url)
+    sys.stderr.write("adk: %s\n" % (reason,))
+    if isinstance(reason, ConnectionRefusedError) or "refused" in str(reason).lower():
+        sys.stderr.write("adk: connection refused - the HTTP channel is stopped, "
+                         "or the port/host is wrong.\n")
+    sys.stderr.write(
+        "adk: hints:\n"
+        "adk:   rig:  adb forward tcp:8787 tcp:8787   (then the default URL works)\n"
+        "adk:   car:  adk --url http://<car-ip>:8787 health   (car hotspot or home Wi-Fi)\n"
+        "adk:   check the ADK app is running and the HTTP channel is started\n"
+    )
+    raise SystemExit(EXIT_REMOTE)
+
+
+def open_url(ctx, method, path, params=None, body=None, raw=None, timeout=None,
+             token_required=True):
+    """Build and send one request; returns the live http.client response object."""
+    url = build_url(ctx.url, path, params)
+    data = None
+    extra = {}
+    if raw is not None:
+        data = raw
+        extra["Content-Type"] = "application/octet-stream"
+        if isinstance(raw, (bytes, bytearray)):
+            extra["Content-Length"] = str(len(raw))
+        else:
+            try:
+                pos = raw.tell()
+                raw.seek(0, os.SEEK_END)
+                extra["Content-Length"] = str(raw.tell() - pos)
+                raw.seek(pos)
+            except (OSError, ValueError):
+                pass
+    elif body is not None:
+        data = json.dumps(body).encode("utf-8")
+        extra["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, method=method,
+                                 headers=ctx.headers(token_required, extra))
+    t = timeout if timeout is not None else ctx.timeout
+    try:
+        return urllib.request.urlopen(req, timeout=t), url
+    except urllib.error.HTTPError as exc:
+        payload = b""
+        try:
+            payload = exc.read(65536)
+        except Exception:
+            pass
+        fail_http(method, url, exc.code, exc.reason, payload)
+    except urllib.error.URLError as exc:
+        fail_net(url, exc)
+    except (TimeoutError, OSError) as exc:
+        fail_net(url, exc)
+
+
+def http_request(ctx, method, path, params=None, body=None, raw=None, timeout=None,
+                 token_required=True):
+    resp, url = open_url(ctx, method, path, params, body, raw, timeout, token_required)
+    with resp:
+        payload = resp.read()
+        return Response(resp.status, dict(resp.headers), payload, url)
+
+
+def stream_request(ctx, path, params=None, timeout=None, token_required=True):
+    """GET a streaming response and copy it to stdout as it arrives."""
+    resp, _url = open_url(ctx, "GET", path, params=params, timeout=timeout,
+                          token_required=token_required)
+    try:
+        with resp:
+            while True:
+                chunk = resp.read(8192)
+                if not chunk:
+                    break
+                sys.stdout.buffer.write(chunk)
+                sys.stdout.buffer.flush()
+    except KeyboardInterrupt:
+        sys.stderr.write("\n")
+    except (BrokenPipeError, ConnectionResetError):
+        pass
+    return EXIT_OK
+
+
+# ------------------------------------------------------------------ api helpers
+
+
+def api_json(ctx, method, path, params=None, body=None, raw=None, token_required=True,
+             timeout=None, what=None):
+    """Send a request and return the decoded JSON body (dies if it is not JSON)."""
+    resp = http_request(ctx, method, path, params=params, body=body, raw=raw,
+                        token_required=token_required, timeout=timeout)
+    text = resp.data.decode("utf-8", "replace")
+    obj = try_json(text)
+    if obj is None:
+        label = what or ("%s %s" % (method, path))
+        die("adk: %s did not return JSON (HTTP %s):\n%s"
+            % (label, resp.status, text.strip()[:1000]), EXIT_REMOTE)
+    return obj
+
+
+def show_json(obj, exit_on_false=True):
+    """Pretty-print a JSON response; return False when the remote reported ok=false."""
+    print_json(obj)
+    if exit_on_false and isinstance(obj, dict) and obj.get("ok") is False:
+        return False
+    return True
+
+
+def emit(ctx, resp, out_path=None, force_binary=None, raw_text=False):
+    """Print or save a response according to its type."""
+    ct = resp.content_type
+    if force_binary is None:
+        binary = is_binary_ct(ct)
+        if binary is None:
+            binary = looks_binary(resp.data)
+    else:
+        binary = force_binary
+
+    if out_path:
+        n = write_bytes(out_path, resp.data)
+        info(ctx, "adk: wrote %s (%d bytes)" % (out_path, n))
+        return EXIT_OK
+    if binary:
+        fd, path = tempfile.mkstemp(prefix="adk-", suffix=suffix_for(ct))
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(resp.data)
+        print(path)
+        return EXIT_OK
+    text = resp.data.decode("utf-8", "replace")
+    if raw_text:
+        print_text(text)
+        return EXIT_OK
+    obj = try_json(text)
+    if obj is not None:
+        print_json(obj)
+    else:
+        print_text(text)
+    return EXIT_OK
+
+
+# --------------------------------------------------------------- endpoint index
+
+
+def fetch_help(ctx):
+    obj = api_json(ctx, "GET", "/help", what="GET /help")
+    eps = obj.get("endpoints")
+    if not isinstance(eps, list):
+        die("adk: GET /help returned no endpoint list", EXIT_REMOTE)
+    return obj, eps
+
+
+def match_endpoint(eps, target):
+    t = (target or "").strip()
+    if not t:
+        die("adk: call needs an operation_id or \"METHOD /path\"", EXIT_USAGE)
+    low = t.lower()
+    for ep in eps:
+        if str(ep.get("operation_id", "")).lower() == low:
+            return ep
+    m = re.match(r"^([A-Za-z]+)\s+(\S+)$", t)
+    if m:
+        method, path = m.group(1).upper(), m.group(2)
+        for ep in eps:
+            if str(ep.get("method", "")).upper() == method and ep.get("path") == path:
+                return ep
+        die("adk: no endpoint %s %s; run `adk endpoints` for the live list"
+            % (method, path), EXIT_USAGE)
+    cands = [ep for ep in eps
+             if ep.get("path") == t or str(ep.get("path", "")).rstrip("/") == t.rstrip("/")]
+    if len(cands) == 1:
+        return cands[0]
+    if len(cands) > 1:
+        die("adk: %s matches several endpoints (%s); use \"METHOD /path\""
+            % (t, ", ".join(sorted(str(c.get("method")) for c in cands))), EXIT_USAGE)
+    cands = [ep for ep in eps if low in str(ep.get("operation_id", "")).lower()]
+    if len(cands) == 1:
+        return cands[0]
+    die("adk: no endpoint matches %r; run `adk endpoints` (or `adk endpoints --json`)"
+        % t, EXIT_USAGE)
+
+
+def coerce_value(value, ptype):
+    ptype = (ptype or "string").lower()
+    if ptype == "int":
+        try:
+            return int(value)
+        except ValueError:
+            die("adk: expected an int, got %r" % value, EXIT_USAGE)
+    if ptype == "double":
+        try:
+            return float(value)
+        except ValueError:
+            die("adk: expected a number, got %r" % value, EXIT_USAGE)
+    if ptype == "bool":
+        low = value.strip().lower()
+        if low in ("1", "true", "yes", "on"):
+            return True
+        if low in ("0", "false", "no", "off"):
+            return False
+        die("adk: expected a bool (1/0/true/false), got %r" % value, EXIT_USAGE)
+    if ptype == "json":
+        try:
+            return json.loads(value)
+        except ValueError:
+            die("adk: expected JSON, got %r" % value, EXIT_USAGE)
+    return value
+
+
+def guess_value(value):
+    """Type guess for keys the endpoint table does not declare."""
+    low = value.strip().lower()
+    if low in ("true", "false"):
+        return low == "true"
+    if re.match(r"^-?\d+$", value.strip()):
+        return int(value.strip())
+    if value.strip()[:1] in "{[":
+        try:
+            return json.loads(value)
+        except ValueError:
+            return value
+    return value
+
+
+# -------------------------------------------------------------------- commands
+
+
+def cmd_pair(args, ctx):
+    body = {"code": args.code}
+    if args.name:
+        body["name"] = args.name
+    obj = api_json(ctx, "POST", "/pair", body=body, token_required=False, what="POST /pair")
+    if not obj.get("ok"):
+        print_json(obj)
+        return EXIT_REMOTE
+    token = obj.get("token")
+    if not token:
+        die("adk: POST /pair returned no token: %s" % json.dumps(obj), EXIT_REMOTE)
+    path = save_token(token)
+    print("client_id: %s" % obj.get("client_id", ""))
+    info(ctx, "adk: paired as %r; token saved to %s (mode 600)"
+         % (obj.get("name", args.name or ""), path))
+    return EXIT_OK
+
+
+def cmd_token(args, ctx):
+    if not ctx.token:
+        sys.stderr.write(PAIR_HINT)
+        return EXIT_USAGE
+    source = ctx.token_source or "?"
+    if args.show:
+        print("source: %s" % source)
+        print("token:  %s" % ctx.token)
+    else:
+        print("source: %s" % source)
+        print("token:  %s... (%d chars, use --show for the full value)"
+              % (ctx.token[:8], len(ctx.token)))
+    return EXIT_OK
+
+
+def cmd_use(args, ctx):
+    path = save_token(args.token_value)
+    print("token saved to %s (mode 600)" % path)
+    return EXIT_OK
+
+
+def cmd_endpoints(args, ctx):
+    _obj, eps = fetch_help(ctx)
+    if args.json:
+        print_json(eps)
+        return EXIT_OK
+    rows = []
+    for ep in eps:
+        rows.append((
+            str(ep.get("operation_id", "")),
+            str(ep.get("method", "")),
+            str(ep.get("path", "")),
+            str(ep.get("summary", "")),
+        ))
+    headers = ("OPERATION_ID", "METHOD", "PATH", "SUMMARY")
+    w_id = max([len(headers[0])] + [len(r[0]) for r in rows]) if rows else len(headers[0])
+    w_m = max([len(headers[1])] + [len(r[1]) for r in rows]) if rows else len(headers[1])
+    w_p = max([len(headers[2])] + [len(r[2]) for r in rows]) if rows else len(headers[2])
+    try:
+        width = int(os.environ.get("COLUMNS", "") or 0)
+    except ValueError:
+        width = 0
+    if width <= 0:
+        width = 120
+    w_s = max(20, width - (w_id + w_m + w_p + 6))
+    print("%-*s  %-*s  %-*s  %s" % (w_id, headers[0], w_m, headers[1],
+                                    w_p, headers[2], headers[3]))
+    for op_id, method, path, summary in rows:
+        if len(summary) > w_s:
+            summary = summary[:w_s - 1] + "~"
+        print("%-*s  %-*s  %-*s  %s" % (w_id, op_id, w_m, method, w_p, path, summary))
+    info(ctx, "adk: %d endpoints; run one with `adk call <operation_id> key=value ...`"
+         % len(rows))
+    return EXIT_OK
+
+
+def cmd_call(args, ctx):
+    _obj, eps = fetch_help(ctx)
+    ep = match_endpoint(eps, args.target)
+    method = str(ep.get("method", "GET")).upper()
+    path = str(ep.get("path", ""))
+    declared = {}
+    raw_needed = False
+    for p in ep.get("parameters", []) or []:
+        declared[(str(p.get("in", "")), str(p.get("name", "")))] = p
+        if p.get("in") == "body" and p.get("type") == "file":
+            raw_needed = True
+
+    if args.json_body is not None:
+        try:
+            extra = json.loads(args.json_body)
+        except ValueError as exc:
+            die("adk: --json is not valid JSON: %s" % exc, EXIT_USAGE)
+        if not isinstance(extra, dict):
+            die("adk: --json must be a JSON object", EXIT_USAGE)
+    else:
+        extra = {}
+
+    query = {}
+    body = {}
+    if method == "GET":
+        for key, value in extra.items():
+            query[key] = value if isinstance(value, str) else json.dumps(value)
+    else:
+        body.update(extra)
+
+    for pair in args.params:
+        if "=" not in pair:
+            die("adk: expected key=value, got %r" % pair, EXIT_USAGE)
+        key, value = pair.split("=", 1)
+        spec = declared.get(("body", key))
+        if method == "GET" or (spec is None and declared.get(("query", key)) is not None):
+            query[key] = value
+        elif spec is not None:
+            body[key] = coerce_value(value, spec.get("type"))
+        else:
+            body[key] = guess_value(value)
+
+    if args.file:
+        if method == "GET":
+            die("adk: --file only makes sense for POST endpoints", EXIT_USAGE)
+        if not os.path.isfile(args.file):
+            die("adk: no such file: %s" % args.file, EXIT_USAGE)
+        with open(args.file, "rb") as fh:
+            resp = http_request(ctx, method, path, params=query, raw=fh, timeout=ctx.timeout)
+    else:
+        if raw_needed and not body:
+            die("adk: %s takes a raw body; pass --file PATH" % ep.get("operation_id"), EXIT_USAGE)
+        resp = http_request(ctx, method, path, params=query or None,
+                            body=(body if method != "GET" else None))
+
+    returns = str(ep.get("returns", "json")).lower()
+    force_binary = None
+    raw_text = False
+    if returns in ("image/png", "image/jpeg", "video/mp4", "binary"):
+        force_binary = True
+    elif returns == "text":
+        raw_text = True
+    return emit(ctx, resp, out_path=args.out, force_binary=force_binary, raw_text=raw_text)
+
+
+def cmd_health(args, ctx):
+    obj = api_json(ctx, "GET", "/health", token_required=False, what="GET /health")
+    return EXIT_OK if show_json(obj) else EXIT_REMOTE
+
+
+def cmd_state(args, ctx):
+    return EXIT_OK if show_json(api_json(ctx, "GET", "/state")) else EXIT_REMOTE
+
+
+def cmd_version(args, ctx):
+    return EXIT_OK if show_json(api_json(ctx, "GET", "/version")) else EXIT_REMOTE
+
+
+def cmd_exec(args, ctx):
+    command = " ".join(args.command)
+    timeout = ctx.timeout
+    body = {"cmd": command, "timeout_ms": int(min(timeout, 600) * 1000)}
+    obj = api_json(ctx, "POST", "/exec", body=body, timeout=timeout + 10, what="POST /exec")
+    out = obj.get("stdout") or ""
+    err = obj.get("stderr") or ""
+    if out:
+        sys.stdout.write(out)
+        sys.stdout.flush()
+    if err:
+        sys.stderr.write(err)
+        sys.stderr.flush()
+    if obj.get("timeout"):
+        info(ctx, "adk: command timed out after %sms" % obj.get("ms"))
+    try:
+        return int(obj.get("exit", 0))
+    except (TypeError, ValueError):
+        return EXIT_REMOTE
+
+
+def stdin_ready(timeout):
+    """True when a line can be read from stdin without blocking."""
+    try:
+        import select
+        ready, _w, _x = select.select([sys.stdin], [], [], timeout)
+        return bool(ready)
+    except Exception:
+        return True
+
+
+def cmd_sh(args, ctx):
+    opened = api_json(ctx, "GET", "/shell/open", what="GET /shell/open")
+    sid = opened.get("session_id") or opened.get("sid")
+    if not sid:
+        die("adk: /shell/open returned no session id: %s" % json.dumps(opened), EXIT_REMOTE)
+    interactive = sys.stdin.isatty()
+    offset = 0
+    eof = False
+    quiet_polls = 0
+    status = EXIT_OK
+    info(ctx, "adk: shell session %s (Ctrl-D closes it)" % sid)
+    try:
+        while True:
+            obj = api_json(ctx, "GET", "/shell/read",
+                           params={"sid": sid, "offset": offset,
+                                   "wait_ms": 0 if interactive else 1500},
+                           what="GET /shell/read")
+            data = obj.get("data") or ""
+            offset = obj.get("offset", offset)
+            if data:
+                sys.stdout.write(data)
+                sys.stdout.flush()
+                quiet_polls = 0
+            else:
+                quiet_polls += 1
+            if not obj.get("alive", True):
+                try:
+                    status = int(obj.get("exit") or 0)
+                except (TypeError, ValueError):
+                    status = EXIT_OK
+                break
+            if eof and quiet_polls >= 2:
+                break
+            if not eof:
+                if not stdin_ready(0.25 if interactive else 0.05):
+                    continue
+                line = sys.stdin.readline()
+                if line == "":
+                    eof = True
+                    continue
+                api_json(ctx, "POST", "/shell/write", params={"sid": sid},
+                         body={"sid": sid, "data": line.rstrip("\r\n")},
+                         what="POST /shell/write")
+    except KeyboardInterrupt:
+        sys.stderr.write("\n")
+    finally:
+        try:
+            api_json(ctx, "GET", "/shell/close", params={"sid": sid}, what="GET /shell/close")
+        except (SystemExit, Exception):
+            pass
+    info(ctx, "adk: session closed")
+    return status
+
+
+def cmd_install(args, ctx):
+    if not os.path.isfile(args.apk):
+        die("adk: no such APK: %s" % args.apk, EXIT_USAGE)
+    params = {
+        "replace": "1",
+        "downgrade": "0" if args.no_downgrade else "1",
+        "grant": "0" if args.no_grant else "1",
+        "user": str(args.user),
+    }
+    timeout = max(ctx.timeout, 300.0)
+    with open(args.apk, "rb") as fh:
+        obj = api_json(ctx, "POST", "/install", params=params, raw=fh, timeout=timeout,
+                       what="POST /install")
+    ok = show_json(obj)
+    if ok:
+        info(ctx, "adk: installed %s %s" % (obj.get("package", "?"),
+                                            obj.get("version_name", "")))
+    return EXIT_OK if ok else EXIT_REMOTE
+
+
+def cmd_packages(args, ctx):
+    params = {}
+    if args.filter:
+        params["filter"] = args.filter
+    if args.third_party:
+        params["third_party"] = "1"
+    if args.labels:
+        params["labels"] = "1"
+    return EXIT_OK if show_json(api_json(ctx, "GET", "/packages", params=params)) else EXIT_REMOTE
+
+
+def cmd_uninstall(args, ctx):
+    obj = api_json(ctx, "POST", "/uninstall", params={"pkg": args.pkg},
+                   body={"pkg": args.pkg}, what="POST /uninstall")
+    return EXIT_OK if show_json(obj) else EXIT_REMOTE
+
+
+def cmd_logs(args, ctx):
+    params = {"lines": str(args.lines)}
+    if args.tag:
+        params["tag"] = args.tag
+    if args.grep:
+        params["grep"] = args.grep
+    if args.pid:
+        params["pid"] = args.pid
+    if args.level:
+        params["level"] = args.level
+    if args.buffers:
+        params["buffers"] = args.buffers
+    if args.jsonl:
+        params["jsonl"] = "1"
+    if args.follow:
+        params["follow"] = "1"
+        timeout = args.timeout if args.timeout is not None else 3600.0
+        return stream_request(ctx, "/logs", params=params, timeout=timeout)
+    resp = http_request(ctx, "GET", "/logs", params=params)
+    return emit(ctx, resp, raw_text=True)
+
+
+def cmd_report(args, ctx):
+    params = {"lines": str(args.lines)}
+    if args.pkg:
+        params["pkg"] = args.pkg
+    resp = http_request(ctx, "GET", "/report", params=params,
+                        timeout=max(ctx.timeout, 120.0))
+    return emit(ctx, resp, out_path=args.out, raw_text=True)
+
+
+def cmd_shot(args, ctx):
+    params = {"format": "jpeg" if args.jpeg else "png"}
+    if args.scale is not None:
+        params["scale"] = str(args.scale)
+    if args.quality is not None:
+        params["quality"] = str(args.quality)
+    resp = http_request(ctx, "GET", "/screenshot", params=params)
+    return emit(ctx, resp, out_path=args.out, force_binary=True)
+
+
+def cmd_record(args, ctx):
+    params = {"seconds": str(args.seconds)}
+    if args.size:
+        params["size"] = args.size
+    if args.bitrate:
+        params["bitrate"] = args.bitrate
+    timeout = max(ctx.timeout, float(args.seconds) + 120.0)
+    resp = http_request(ctx, "GET", "/screenrecord", params=params, timeout=timeout)
+    return emit(ctx, resp, out_path=args.out, force_binary=True)
+
+
+def cmd_ui(args, ctx):
+    params = {"format": "xml" if args.xml else "json"}
+    resp = http_request(ctx, "GET", "/ui", params=params)
+    return emit(ctx, resp, out_path=args.out, raw_text=args.xml)
+
+
+def cmd_wait(args, ctx):
+    params = {}
+    if args.text:
+        params["text"] = args.text
+    if args.id:
+        params["id"] = args.id
+    if args.desc:
+        params["desc"] = args.desc
+    if not params:
+        die("adk: wait needs TEXT, --id or --desc", EXIT_USAGE)
+    if args.tap:
+        params["tap"] = "1"
+    params["timeout_ms"] = str(args.timeout_ms)
+    if args.interval_ms:
+        params["interval_ms"] = str(args.interval_ms)
+    timeout = max(ctx.timeout, args.timeout_ms / 1000.0 + 15.0)
+    obj = api_json(ctx, "GET", "/wait", params=params, timeout=timeout, what="GET /wait")
+    return EXIT_OK if show_json(obj) else EXIT_REMOTE
+
+
+def input_action(ctx, body):
+    obj = api_json(ctx, "POST", "/input", body=body, what="POST /input")
+    return EXIT_OK if show_json(obj) else EXIT_REMOTE
+
+
+def cmd_tap(args, ctx):
+    return input_action(ctx, {"action": "tap", "x": args.x, "y": args.y})
+
+
+def cmd_longpress(args, ctx):
+    return input_action(ctx, {"action": "longpress", "x": args.x, "y": args.y,
+                              "duration": args.ms})
+
+
+def cmd_swipe(args, ctx):
+    return input_action(ctx, {"action": "swipe", "x1": args.x1, "y1": args.y1,
+                              "x2": args.x2, "y2": args.y2, "duration": args.ms})
+
+
+def cmd_text(args, ctx):
+    return input_action(ctx, {"action": "text", "text": " ".join(args.text)})
+
+
+def cmd_key(args, ctx):
+    return input_action(ctx, {"action": "key", "key": args.keycode})
+
+
+def cmd_settings(args, ctx):
+    if args.action == "get":
+        obj = api_json(ctx, "GET", "/settings",
+                       params={"ns": args.ns, "key": args.key}, what="GET /settings")
+    elif args.action == "list":
+        obj = api_json(ctx, "GET", "/settings",
+                       params={"ns": args.ns, "all": "1"}, what="GET /settings")
+    elif args.action == "set":
+        obj = api_json(ctx, "POST", "/settings",
+                       body={"ns": args.ns, "key": args.key, "value": args.value},
+                       what="POST /settings")
+    else:  # delete
+        obj = api_json(ctx, "POST", "/settings",
+                       body={"ns": args.ns, "key": args.key, "delete": True},
+                       what="POST /settings")
+    return EXIT_OK if show_json(obj) else EXIT_REMOTE
+
+
+def cmd_ls(args, ctx):
+    obj = api_json(ctx, "GET", "/ls", params={"path": args.path}, what="GET /ls")
+    return EXIT_OK if show_json(obj) else EXIT_REMOTE
+
+
+def cmd_get(args, ctx):
+    resp = http_request(ctx, "GET", "/file", params={"path": args.remote})
+    if args.text:
+        print_text(resp.data.decode("utf-8", "replace"))
+        return EXIT_OK
+    return emit(ctx, resp, out_path=args.local)
+
+
+def cmd_put(args, ctx):
+    if not os.path.isfile(args.local):
+        die("adk: no such file: %s" % args.local, EXIT_USAGE)
+    params = {"path": args.remote}
+    if args.append:
+        params["append"] = "1"
+    timeout = max(ctx.timeout, 120.0)
+    with open(args.local, "rb") as fh:
+        obj = api_json(ctx, "POST", "/file", params=params, raw=fh, timeout=timeout,
+                       what="POST /file")
+    return EXIT_OK if show_json(obj) else EXIT_REMOTE
+
+
+def cmd_foreground(args, ctx):
+    return EXIT_OK if show_json(api_json(ctx, "GET", "/foreground")) else EXIT_REMOTE
+
+
+def cmd_dumpsys(args, ctx):
+    params = {"service": args.service}
+    if args.grep:
+        params["grep"] = args.grep
+    if args.lines:
+        params["lines"] = str(args.lines)
+    resp = http_request(ctx, "GET", "/dumpsys", params=params,
+                        timeout=max(ctx.timeout, 120.0))
+    return emit(ctx, resp, raw_text=True)
+
+
+def build_intent_body(argv):
+    if len(argv) == 1 and argv[0].lstrip().startswith("{"):
+        try:
+            obj = json.loads(argv[0])
+        except ValueError as exc:
+            die("adk: intent JSON is invalid: %s" % exc, EXIT_USAGE)
+        if not isinstance(obj, dict):
+            die("adk: intent JSON must be an object", EXIT_USAGE)
+        return obj
+    body = {}
+    for pair in argv:
+        if "=" not in pair:
+            die("adk: intent takes a JSON object or key=value pairs, got %r" % pair,
+                EXIT_USAGE)
+        key, value = pair.split("=", 1)
+        if key in ("extras", "extras_int", "extras_bool", "flags"):
+            try:
+                body[key] = json.loads(value)
+            except ValueError:
+                die("adk: intent %s must be JSON, got %r" % (key, value), EXIT_USAGE)
+        elif key == "user":
+            body[key] = coerce_value(value, "int")
+        else:
+            body[key] = value
+    return body
+
+
+def cmd_intent(args, ctx):
+    body = build_intent_body(args.args)
+    if not body:
+        die("adk: intent needs a JSON body or key=value pairs", EXIT_USAGE)
+    obj = api_json(ctx, "POST", "/intent", body=body, what="POST /intent")
+    return EXIT_OK if show_json(obj) else EXIT_REMOTE
+
+
+def cmd_forward(args, ctx):
+    if args.action == "add":
+        body = {"bind": args.bind, "local_port": args.local_port,
+                "host": args.host, "port": args.port}
+        obj = api_json(ctx, "POST", "/forward/add", body=body, what="POST /forward/add")
+    elif args.action == "list":
+        obj = api_json(ctx, "GET", "/forward/list", what="GET /forward/list")
+    else:
+        obj = api_json(ctx, "POST", "/forward/remove", params={"id": args.id},
+                       body={"id": args.id}, what="POST /forward/remove")
+    return EXIT_OK if show_json(obj) else EXIT_REMOTE
+
+
+def cmd_clients(args, ctx):
+    return EXIT_OK if show_json(api_json(ctx, "GET", "/clients")) else EXIT_REMOTE
+
+
+def cmd_revoke(args, ctx):
+    obj = api_json(ctx, "POST", "/pair/revoke", body={"client_id": args.client_id},
+                   what="POST /pair/revoke")
+    return EXIT_OK if show_json(obj) else EXIT_REMOTE
+
+
+def cmd_selfupdate(args, ctx):
+    if not os.path.isfile(args.apk):
+        die("adk: no such APK: %s" % args.apk, EXIT_USAGE)
+    timeout = max(ctx.timeout, 300.0)
+    with open(args.apk, "rb") as fh:
+        obj = api_json(ctx, "POST", "/selfupdate", raw=fh, timeout=timeout,
+                       what="POST /selfupdate")
+    ok = show_json(obj)
+    info(ctx, "adk: ADK will auto-rollback in 180s unless you confirm.\n"
+              "adk:   verify:  adk health && adk version\n"
+              "adk:   keep it: adk confirm\n"
+              "adk:   undo it: adk rollback")
+    return EXIT_OK if ok else EXIT_REMOTE
+
+
+def cmd_confirm(args, ctx):
+    return EXIT_OK if show_json(api_json(ctx, "POST", "/selfupdate/confirm")) else EXIT_REMOTE
+
+
+def cmd_rollback(args, ctx):
+    return EXIT_OK if show_json(api_json(ctx, "POST", "/selfupdate/rollback")) else EXIT_REMOTE
+
+
+def cmd_reboot(args, ctx):
+    obj = api_json(ctx, "POST", "/reboot", body={"mode": args.mode or ""}, what="POST /reboot")
+    return EXIT_OK if show_json(obj) else EXIT_REMOTE
+
+
+HANDLERS = {
+    "pair": cmd_pair,
+    "token": cmd_token,
+    "use": cmd_use,
+    "endpoints": cmd_endpoints,
+    "call": cmd_call,
+    "health": cmd_health,
+    "state": cmd_state,
+    "version": cmd_version,
+    "exec": cmd_exec,
+    "sh": cmd_sh,
+    "install": cmd_install,
+    "packages": cmd_packages,
+    "uninstall": cmd_uninstall,
+    "logs": cmd_logs,
+    "report": cmd_report,
+    "shot": cmd_shot,
+    "record": cmd_record,
+    "ui": cmd_ui,
+    "wait": cmd_wait,
+    "tap": cmd_tap,
+    "longpress": cmd_longpress,
+    "swipe": cmd_swipe,
+    "text": cmd_text,
+    "key": cmd_key,
+    "settings": cmd_settings,
+    "ls": cmd_ls,
+    "get": cmd_get,
+    "put": cmd_put,
+    "foreground": cmd_foreground,
+    "dumpsys": cmd_dumpsys,
+    "intent": cmd_intent,
+    "forward": cmd_forward,
+    "clients": cmd_clients,
+    "revoke": cmd_revoke,
+    "selfupdate": cmd_selfupdate,
+    "confirm": cmd_confirm,
+    "rollback": cmd_rollback,
+    "reboot": cmd_reboot,
+}
+
+
+# ------------------------------------------------------------------- argparse
+
+
+EPILOG = """\
+examples:
+  adb forward tcp:8787 tcp:8787          # rig only: makes the default URL work
+  adk pair 123456 --name mac-agent       # 6-digit code shown in the car app
+  adk health
+  adk exec getprop ro.build.version.release
+  adk install app/build/outputs/apk/release/app-release.apk
+  adk logs --lines 300 --grep 'FATAL|AndroidRuntime'
+  adk logs --follow --tag OPENHU
+  adk shot /tmp/car.png && adk ui | head -50
+  adk wait Settings --tap --timeout 10000
+  adk call post_input action=tap x=960 y=540
+  adk call "POST /input" --json '{"action":"key","key":"KEYCODE_HOME"}'
+  adk call get_file path=/proc/version --out /tmp/version.txt
+  adk call post_install --file dist/AgenticDevelopmentKit-0.1.0.apk replace=1
+  adk endpoints | grep -i screenshot
+
+environment:
+  ADK_URL    base URL (default http://127.0.0.1:8787)
+  ADK_TOKEN  API token, else ~/.adk/token is used
+
+exit codes:
+  0 success   1 HTTP/remote error   2 usage or config error
+  (exec and sh propagate the remote command's exit code)
+
+docs: docs/AGENT.md
+"""
+
+
+def add_common(p, suppress=False, skip=()):
+    def dflt(value):
+        return argparse.SUPPRESS if suppress else value
+
+    p.add_argument("--url", metavar="URL", default=dflt(None),
+                   help="ADK base URL (env ADK_URL; default %s)" % DEFAULT_URL)
+    p.add_argument("--token", metavar="TOKEN", default=dflt(None),
+                   help="API token (env ADK_TOKEN; else ~/.adk/token)")
+    if "timeout" not in skip:
+        p.add_argument("--timeout", metavar="SECONDS", type=float, default=dflt(None),
+                       help="per-request timeout in seconds (default %g; streaming needs more)"
+                            % DEFAULT_TIMEOUT)
+    p.add_argument("--quiet", action="store_true", default=dflt(False),
+                   help="suppress informational messages on stderr")
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="adk",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Drive the Agentic Development Kit (ADK) system app on an MG4 head unit.\n"
+                    "Every endpoint is reachable with `adk call`; common ones have a verb.",
+        epilog=EPILOG)
+    parser.add_argument("--version", action="version", version="adk " + VERSION)
+    add_common(parser)
+    sub = parser.add_subparsers(dest="cmd", metavar="COMMAND", title="commands")
+    sub.required = True
+
+    def new(name, help_text, description=None, aliases=None, skip=()):
+        p = sub.add_parser(name, help=help_text, description=description,
+                           aliases=aliases or [],
+                           formatter_class=argparse.RawDescriptionHelpFormatter)
+        add_common(p, suppress=True, skip=skip)
+        return p
+
+    p = new("pair", "exchange the car's 6-digit pairing code for a token",
+            "POST /pair and store the returned token in ~/.adk/token (mode 600).\n"
+            "The code is displayed by the ADK app on the car screen and is only\n"
+            "valid while the pairing window is open (`adk call get_pair_status`).")
+    p.add_argument("code", help="6-digit code shown in the car app")
+    p.add_argument("--name", default="", help="label for this client, e.g. mac-agent")
+
+    p = new("token", "show where the token comes from and its first 8 chars")
+    p.add_argument("--show", action="store_true", help="print the full token")
+
+    p = new("use", "store a token in ~/.adk/token")
+    p.add_argument("token_value", metavar="TOKEN", help="token to store (64 hex chars)")
+
+    p = new("endpoints", "list the live API surface from GET /help",
+            "Prints operation_id, method, path and summary for every endpoint the\n"
+            "running app exposes. Use the operation_id with `adk call`.")
+    p.add_argument("--json", action="store_true", help="print the raw JSON list")
+
+    p = new("call", "call any endpoint by operation_id or \"METHOD /path\"",
+            "Looks the endpoint up in GET /help, sends key=value as query params for\n"
+            "GET endpoints and as a JSON body for POST endpoints, and prints the\n"
+            "response (JSON pretty-printed, text raw, binary to --out or a temp file).\n\n"
+            "examples:\n"
+            "  adk call get_state\n"
+            "  adk call get_logs lines=100 grep=FATAL\n"
+            "  adk call post_input action=swipe x1=100 y1=200 x2=900 y2=200 duration=400\n"
+            "  adk call \"POST /input\" --json '{\"action\":\"key\",\"key\":\"KEYCODE_HOME\"}'\n"
+            "  adk call post_install --file app.apk replace=1\n"
+            "  adk call get_screenshot --out /tmp/car.png")
+    p.add_argument("target", metavar="OPERATION_ID|\"METHOD /path\"",
+                   help="operation_id from `adk endpoints`, or e.g. \"POST /input\"")
+    p.add_argument("params", nargs="*", metavar="key=value",
+                   help="parameters (query for GET, JSON body fields for POST)")
+    p.add_argument("--json", dest="json_body", metavar="BODY",
+                   help="JSON object merged into the request body/query")
+    p.add_argument("--file", metavar="PATH",
+                   help="stream PATH as the raw request body (APK/file uploads)")
+    p.add_argument("--out", metavar="PATH", help="write the response body to PATH")
+
+    p = new("health", "GET /health (no token) - is the channel alive")
+    p = new("state", "GET /state - device, build, battery, network, foreground app")
+    p = new("version", "GET /version - app version, uptime, pending rollback")
+
+    p = new("exec", "run a shell command as system and print stdout/stderr",
+            "POST /exec. The exit code of the remote command becomes adk's exit code.\n"
+            "Put adk's own flags before the command; use `--` if the command itself\n"
+            "contains something that looks like an adk flag:\n"
+            "  adk exec id\n"
+            "  adk exec getprop ro.build.version.release\n"
+            "  adk --timeout 120 exec pm list packages -3\n"
+            "  adk exec -- ls --color=never")
+    p.add_argument("command", nargs="+", metavar="CMD", help="command to run on the car")
+
+    p = new("sh", "interactive shell session (adb shell without adbd)",
+            "Opens GET /shell/open, pipes stdin lines to /shell/write and prints\n"
+            "/shell/read output until the session ends or you press Ctrl-D.\n"
+            "With piped stdin it sends every line and drains the output; it never\n"
+            "hangs waiting for a prompt.")
+
+    p = new("install", "install or update an APK (POST /install)",
+            "Uploads the APK and runs pm install -r -d -g on user 0 by default.")
+    p.add_argument("apk", metavar="APK", help="local .apk path")
+    p.add_argument("--no-downgrade", action="store_true",
+                   help="refuse same/lower versionCode (drops -d)")
+    p.add_argument("--no-grant", action="store_true", help="do not grant runtime permissions")
+    p.add_argument("--user", type=int, default=0, help="target user id (default 0)")
+
+    p = new("packages", "list installed packages")
+    p.add_argument("--filter", metavar="X", help="case-insensitive substring of the package")
+    p.add_argument("--third-party", action="store_true", help="only non-system packages")
+    p.add_argument("--labels", action="store_true", help="include human labels (slower)")
+
+    p = new("uninstall", "uninstall a package")
+    p.add_argument("pkg", metavar="PKG", help="package name")
+
+    p = new("logs", "logcat: one-shot dump or a live stream",
+            "Text output, one log line per line. With --follow the connection stays\n"
+            "open until you interrupt it; the client timeout defaults to an hour.")
+    p.add_argument("--lines", type=int, default=200, help="tail size (default 200)")
+    p.add_argument("--grep", metavar="RE", help="server-side regex filter")
+    p.add_argument("--tag", metavar="T", help="logcat -s TAG:LEVEL")
+    p.add_argument("--pid", metavar="PID", help="only this pid")
+    p.add_argument("--level", metavar="L", help="minimum level for --tag (V D I W E F)")
+    p.add_argument("--buffers", metavar="LIST", help="comma list, e.g. main,system,crash")
+    p.add_argument("--jsonl", action="store_true", help="one JSON object per line")
+    p.add_argument("--follow", action="store_true", help="stream until interrupted")
+
+    p = new("report", "one-shot diagnostic bundle (state + logs + dumpsys + net)")
+    p.add_argument("--lines", type=int, default=400, help="logcat tail size (default 400)")
+    p.add_argument("--pkg", metavar="PKG", help="also dump this package")
+    p.add_argument("--out", metavar="FILE", help="write the bundle to FILE")
+
+    p = new("shot", "screenshot the car screen")
+    p.add_argument("out", metavar="OUT.png", help="destination image path")
+    p.add_argument("--scale", type=float, metavar="S", help="resize factor, e.g. 0.5")
+    p.add_argument("--jpeg", action="store_true", help="request JPEG instead of PNG")
+    p.add_argument("--quality", type=int, metavar="Q", help="JPEG quality 1-100")
+
+    p = new("record", "record the screen for N seconds")
+    p.add_argument("out", metavar="OUT.mp4", help="destination video path")
+    p.add_argument("--seconds", type=int, required=True, help="1-180")
+    p.add_argument("--size", metavar="WxH", help="e.g. 1280x720")
+    p.add_argument("--bitrate", metavar="BPS", help="e.g. 4000000")
+
+    p = new("ui", "dump the uiautomator hierarchy")
+    p.add_argument("--xml", action="store_true", help="raw XML instead of JSON nodes")
+    p.add_argument("--out", metavar="FILE", help="write to FILE instead of stdout")
+
+    p = new("wait", "wait for UI text/id/desc; optionally tap it when found",
+            "Exits 0 when found, 1 on timeout (HTTP 408, body shows elapsed_ms).\n"
+            "Here --timeout is in milliseconds (the wait budget); adk's global\n"
+            "--timeout SECONDS still works when placed before `wait`.",
+            skip=("timeout",))
+    p.add_argument("text", nargs="?", metavar="TEXT", help="substring of text or content-desc")
+    p.add_argument("--id", metavar="ID", help="substring of resource-id")
+    p.add_argument("--desc", metavar="DESC", help="substring of content-desc")
+    p.add_argument("--tap", action="store_true", help="tap the centre of the match")
+    p.add_argument("--timeout", "--timeout-ms", dest="timeout_ms", type=int, default=20000,
+                   metavar="MS", help="give up after MS milliseconds (default 20000)")
+    p.add_argument("--interval", dest="interval_ms", type=int, metavar="MS",
+                   help="poll interval (default 700)")
+
+    p = new("tap", "tap at X Y")
+    p.add_argument("x", type=int)
+    p.add_argument("y", type=int)
+
+    p = new("longpress", "long-press at X Y")
+    p.add_argument("x", type=int)
+    p.add_argument("y", type=int)
+    p.add_argument("--ms", type=int, default=1000, help="duration in ms (default 1000)")
+
+    p = new("swipe", "swipe from X1 Y1 to X2 Y2")
+    p.add_argument("x1", type=int)
+    p.add_argument("y1", type=int)
+    p.add_argument("x2", type=int)
+    p.add_argument("y2", type=int)
+    p.add_argument("--ms", type=int, default=300, help="duration in ms (default 300)")
+
+    p = new("text", "type text into the focused field")
+    p.add_argument("text", nargs="+", metavar="STR")
+
+    p = new("key", "send a key event, e.g. KEYCODE_HOME")
+    p.add_argument("keycode", metavar="KEYCODE")
+
+    p = new("settings", "read or write Settings values",
+            "examples:\n"
+            "  adk settings get global airplane_mode_on\n"
+            "  adk settings set system screen_brightness 120\n"
+            "  adk settings list secure\n"
+            "  adk settings delete global adk_note")
+    ss = p.add_subparsers(dest="action", metavar="ACTION")
+    ss.required = True
+    g = ss.add_parser("get", help="read one key")
+    g.add_argument("ns", choices=["global", "system", "secure"])
+    g.add_argument("key")
+    s = ss.add_parser("set", help="write one key")
+    s.add_argument("ns", choices=["global", "system", "secure"])
+    s.add_argument("key")
+    s.add_argument("value")
+    l = ss.add_parser("list", help="list a whole namespace")
+    l.add_argument("ns", choices=["global", "system", "secure"])
+    d = ss.add_parser("delete", help="delete one key")
+    d.add_argument("ns", choices=["global", "system", "secure"])
+    d.add_argument("key")
+
+    p = new("ls", "list a directory on the car")
+    p.add_argument("path", nargs="?", default="/sdcard", metavar="PATH")
+
+    p = new("get", "download a file from the car",
+            "Binary files go to LOCAL, or to a temp file whose path is printed.")
+    p.add_argument("remote", metavar="REMOTE", help="absolute path on the car")
+    p.add_argument("local", nargs="?", metavar="LOCAL", help="destination path")
+    p.add_argument("--text", action="store_true", help="print to stdout as text")
+
+    p = new("put", "upload a file to the car (POST /file)")
+    p.add_argument("local", metavar="LOCAL")
+    p.add_argument("remote", metavar="REMOTE", help="absolute destination path on the car")
+    p.add_argument("--append", action="store_true", help="append instead of truncate")
+
+    p = new("foreground", "current focused window / resumed activity")
+
+    p = new("dumpsys", "dumpsys a system service")
+    p.add_argument("service", metavar="SERVICE", help="e.g. battery, window, wifi, activity")
+    p.add_argument("--grep", metavar="RE", help="server-side grep -E")
+    p.add_argument("--lines", type=int, help="head -N lines (0 = everything)")
+
+    p = new("intent", "am start / broadcast / force-stop (POST /intent)",
+            "Pass a JSON object, or key=value pairs. extras/extras_int/extras_bool/flags\n"
+            "take JSON; everything else is a string.\n\n"
+            "examples:\n"
+            "  adk intent action=start component=com.drivehub.diauto.mg4/.main.MainActivity\n"
+            "  adk intent '{\"action\":\"broadcast\",\"intent_action\":\"com.example.PING\","
+            "\"extras\":{\"k\":\"v\"}}'\n"
+            "  adk intent action=force-stop package=com.example.app")
+    p.add_argument("args", nargs="*", metavar="JSON|key=value")
+
+    p = new("forward", "TCP forward rules on the car (adb forward / reverse)")
+    fs = p.add_subparsers(dest="action", metavar="ACTION")
+    fs.required = True
+    fa = fs.add_parser("add", help="add a rule")
+    fa.add_argument("--bind", default="0.0.0.0",
+                    help="0.0.0.0 = reachable from the network, 127.0.0.1 = car-local")
+    fa.add_argument("--local-port", type=int, required=True, help="port to listen on, on the car")
+    fa.add_argument("--host", default="127.0.0.1", help="target host")
+    fa.add_argument("--port", type=int, required=True, help="target port")
+    fs.add_parser("list", help="list rules")
+    fr = fs.add_parser("rm", help="remove a rule")
+    fr.add_argument("id", metavar="ID", help="rule id from `adk forward list`")
+
+    p = new("clients", "paired devices (id, name, last seen, ip)")
+
+    p = new("revoke", "revoke a paired device")
+    p.add_argument("client_id", metavar="CLIENT_ID", help="id from `adk clients`")
+
+    p = new("selfupdate", "install a new build of ADK itself (auto-rollback armed)",
+            "Uploads an APK that must have ADK's own package name. After a successful\n"
+            "install, ADK restarts and arms a 180-second auto-rollback: verify with\n"
+            "`adk health`, then run `adk confirm` to keep the new build, or\n"
+            "`adk rollback` to go back immediately.")
+    p.add_argument("apk", metavar="APK", help="new ADK .apk")
+
+    p = new("confirm", "cancel the pending self-update rollback")
+    p = new("rollback", "immediately reinstall the last-known-good ADK build")
+    p = new("reboot", "reboot the head unit")
+    p.add_argument("--mode", metavar="M", default="", help="empty, recovery or bootloader")
+
+    return parser
+
+
+def main(argv=None):
+    parser = build_parser()
+    args, extras = parser.parse_known_args(argv)
+    if extras:
+        if args.cmd == "exec":
+            args.command.extend(extras)
+        elif args.cmd == "call" and all("=" in e for e in extras):
+            # argparse cannot interleave nargs="*" with flags, so `call op --file x k=v`
+            # leaves the trailing key=value pairs over; they belong to the call.
+            args.params.extend(extras)
+        else:
+            parser.error("unrecognized arguments: %s" % " ".join(extras))
+    if not getattr(args, "cmd", None):
+        parser.print_help(sys.stderr)
+        return EXIT_USAGE
+
+    token, source = resolve_token(args.token)
+    ctx = Ctx(normalize_url(args.url or os.environ.get("ADK_URL") or DEFAULT_URL),
+              token, source, args.timeout, args.quiet)
+    handler = HANDLERS[args.cmd]
+    return handler(args, ctx)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.stderr.write("\nadk: interrupted\n")
+        sys.exit(130)
+    except BrokenPipeError:
+        try:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, sys.stdout.fileno())
+        except OSError:
+            pass
+        sys.exit(EXIT_OK)

@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Agentic Development Kit</string>
+    <string name="notif_channel">ADK control channel</string>
+    <string name="notif_title">Agentic Development Kit running</string>
+    <string name="accessibility_description">Lets the Agentic Development Kit read the screen so an agent can see the car UI (GET /ui, GET /wait).</string>
+</resources>

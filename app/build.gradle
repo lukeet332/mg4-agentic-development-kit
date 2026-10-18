@@ -1,0 +1,48 @@
+plugins {
+    id 'com.android.application'
+}
+
+// CI (and tools/build.sh) can stamp a unique version per build:
+//   ./gradlew :app:assembleRelease -PversionNameOverride=0.1.0+42 -PversionCodeOverride=43
+def versionNameOverride = project.findProperty('versionNameOverride')
+def versionCodeOverride = project.findProperty('versionCodeOverride')
+def adkVersionName = versionNameOverride ?: project.findProperty('adk.versionName') ?: '0.1.0'
+def adkVersionCode = versionCodeOverride ?: project.findProperty('adk.versionCode') ?: '1'
+
+android {
+    namespace 'com.lukeet.agenticdevkit'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.lukeet.agenticdevkit"
+        minSdk 28
+        targetSdk 28
+        versionCode adkVersionCode.toString().toInteger()
+        versionName adkVersionName.toString()
+    }
+
+    buildTypes {
+        debug {
+            minifyEnabled false
+        }
+        release {
+            minifyEnabled false
+            // Signed with the AOSP platform (test) key after assembly, see ../tools/sign.sh
+            signingConfig null
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    lint {
+        abortOnError false
+        checkReleaseBuilds false
+    }
+}
+
+dependencies {
+    // Intentionally empty: the kit is dependency-free so it builds offline and ships tiny.
+}

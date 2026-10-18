@@ -1,0 +1,142 @@
+name: build
+
+# Builds and publishes the platform-signed ADK APK.
+#   - every push to main  -> build + sign + GitHub Release (tag v<version>+<run>)
+#   - pull requests       -> build only, APK as a workflow artifact
+#   - manual runs         -> choose the version bump and whether to release
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'versionName override (e.g. 0.2.0). Empty = use app/build.gradle'
+        required: false
+      release:
+        description: 'Publish a GitHub Release'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Work out the version
+        id: v
+        run: |
+          set -euo pipefail
+          base=$(grep -oP '^adk\.versionName=\K.*' gradle.properties)
+          code=$(grep -oP '^adk\.versionCode=\K[0-9]+' gradle.properties)
+          override="${{ github.event.inputs.version }}"
+          if [ -n "$override" ]; then base="$override"; fi
+          if [ "${{ github.event_name }}" = "push" ]; then
+            # every main push gets a unique, ordered version: 0.1.0+42
+            name="${base}+${{ github.run_number }}"
+            code=$(( code + ${{ github.run_number }} ))
+          else
+            name="$base"
+          fi
+          echo "name=$name"   >> "$GITHUB_OUTPUT"
+          echo "code=$code"   >> "$GITHUB_OUTPUT"
+          echo "tag=v$name"   >> "$GITHUB_OUTPUT"
+          echo "building $name (versionCode $code)"
+
+      - name: Build release APK
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          ./gradlew :app:assembleRelease --no-daemon \
+            -PversionNameOverride='${{ steps.v.outputs.name }}' \
+            -PversionCodeOverride='${{ steps.v.outputs.code }}'
+
+      - name: Restore the platform key
+        env:
+          PLATFORM_PK8_B64: ${{ secrets.PLATFORM_PK8_B64 }}
+          PLATFORM_CERT_B64: ${{ secrets.PLATFORM_CERT_B64 }}
+        run: |
+          set -euo pipefail
+          mkdir -p signing
+          if [ -n "${PLATFORM_PK8_B64:-}" ] && [ -n "${PLATFORM_CERT_B64:-}" ]; then
+            echo "$PLATFORM_PK8_B64"  | base64 -d > signing/platform.pk8
+            echo "$PLATFORM_CERT_B64" | base64 -d > signing/platform.x509.pem
+            echo "using the platform key from repository secrets"
+          else
+            # The AOSP test key is public (it ships in AOSP and in SAIC's firmware).
+            # It is committed so releases are installable as system-uid updates on
+            # the head unit out of the box. Override with secrets for your own key.
+            echo "PLATFORM_PK8_B64/PLATFORM_CERT_B64 not set - using the committed AOSP test key"
+            cp signing/platform.pk8.ci signing/platform.pk8
+            cp signing/platform.x509.pem.ci signing/platform.x509.pem
+          fi
+
+      - name: Align and sign
+        id: sign
+        run: |
+          set -euo pipefail
+          BT="$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)"
+          name='${{ steps.v.outputs.name }}'
+          out="AgenticDevelopmentKit-${name}.apk"
+          "$BT/zipalign" -f 4 app/build/outputs/apk/release/app-release-unsigned.apk dist/aligned.apk
+          "$BT/apksigner" sign \
+            --key signing/platform.pk8 \
+            --cert signing/platform.x509.pem \
+            --out "dist/$out" dist/aligned.apk
+          "$BT/apksigner" verify --print-certs "dist/$out"
+          sha256sum "dist/$out" | tee "dist/$out.sha256"
+          echo "apk=dist/$out" >> "$GITHUB_OUTPUT"
+          echo "name=$out"     >> "$GITHUB_OUTPUT"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AgenticDevelopmentKit-apk
+          path: |
+            dist/*.apk
+            dist/*.sha256
+
+      - name: Publish release
+        if: github.event_name == 'push' || inputs.release == true
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.v.outputs.tag }}
+          name: Agentic Development Kit ${{ steps.v.outputs.name }}
+          body: |
+            Platform-signed Agentic Development Kit APK — the system-level control
+            channel for the MG4 head unit.
+
+            **Install** (adb, or `adb forward` + the app's own `/install`):
+            ```
+            adb install -r AgenticDevelopmentKit-${{ steps.v.outputs.name }}.apk
+            ```
+            **First run:** open *Agentic Development Kit* in the car, note the token
+            (or `adb shell cat /data/local/tmp/adk.token`), then pair an agent with the
+            6-digit code shown by *Pair a device*.
+
+            Signature: the AOSP platform (test) key, so it installs as an in-place
+            update beside the car's other platform-signed apps and runs as
+            `android.uid.system`. Anyone can reproduce this signature — the security
+            boundary is the pairing token, not the certificate.
+          files: |
+            dist/*.apk
+            dist/*.sha256
+          generate_release_notes: true
