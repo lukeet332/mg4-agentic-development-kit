@@ -180,6 +180,27 @@ Then open the app, leave the channel running (it starts on boot via `BOOT_COMPLE
 and pair an agent. Requirements: Android 9 / API 28+ (MG4 head units are API 28), and
 a platform signature that matches the unit — see [signing/README.md](signing/README.md).
 
+## Verifying a release
+
+Two ways, both used on the published `v0.1.0+4`:
+
+```bash
+# 1. the code in the APK is the code in the repo
+python3 - <<'EOF'
+import zipfile, hashlib
+for label, path in (("release", "AgenticDevelopmentKit.apk"), ("local build", "dist/AgenticDevelopmentKit-0.1.0.apk")):
+    with zipfile.ZipFile(path) as z:
+        print(label, hashlib.sha256(z.read("classes.dex")).hexdigest()[:32])
+EOF
+
+# 2. the newest behaviour actually works on the installed build (needs a rig or a car)
+docker exec <rig> python3 /apk/release-verify.py
+```
+
+`rig/release-verify.py` drives the whole thing over HTTP: clear clients, tap **Pair a
+device** on the car screen, read the 6-digit code back off that screen, pair, tap the
+per-row **Revoke**, and assert the device is gone and its token now returns 401.
+
 ## Build
 
 ```bash
