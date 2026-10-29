@@ -44,5 +44,6 @@ android {
 }
 
 dependencies {
-    // Intentionally empty: the kit is dependency-free so it builds offline and ships tiny.
+    // The shipped kit is dependency-free so it builds offline and ships tiny; JUnit is test-only.
+    testImplementation 'junit:junit:4.13.2'
 }

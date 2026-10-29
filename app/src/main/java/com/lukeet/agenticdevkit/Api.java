@@ -219,6 +219,12 @@ public final class Api {
                     q("tap", "bool", false, "false", "tap the centre of the match")),
             new Ep("GET", "/foreground", "token", "json", "current focused window / resumed activity",
                     "curl -H \"X-ADK-Token: $T\" $BASE/foreground"),
+            new Ep("GET", "/usb/hubs", "token", "json", "read-only port status of every USB hub (attached, enabled, powered, over-current)",
+                    "curl -H \"X-ADK-Token: $T\" $BASE/usb/hubs"),
+            new Ep("POST", "/usb/hubport", "token", "json", "reset or power-cycle one port of the internal hub 0424:2514 (port 1, the TBox modem, refused)",
+                    "curl -X POST -H \"X-ADK-Token: $T\" '$BASE/usb/hubport?action=reset&port=2'"),
+            new Ep("GET", "/localsocket", "token", "json", "connect to an init socket (/dev/socket/NAME) as system, optionally send text or hex, and return what it sends back",
+                    "curl -H \"X-ADK-Token: $T\" '$BASE/localsocket?name=bdklogd&read_ms=3000'"),
 
             new Ep("GET", "/settings", "token", "json", "read one setting, or list a whole namespace",
                     "curl -H \"X-ADK-Token: $T\" '$BASE/settings?ns=global&key=airplane_mode_on'",
@@ -365,6 +371,11 @@ public final class Api {
         reg("GET", "/ui", new Handler() { public void run(HttpServer.Request r, HttpServer.Response s) throws Exception { ui(r, s); } });
         reg("GET", "/wait", new Handler() { public void run(HttpServer.Request r, HttpServer.Response s) throws Exception { waitFor(r, s); } });
         reg("GET", "/foreground", new Handler() { public void run(HttpServer.Request r, HttpServer.Response s) throws Exception { foreground(r, s); } });
+        reg("POST", "/usb/hubport", new Handler() { public void run(HttpServer.Request r, HttpServer.Response s) throws Exception { s.json(200, UsbHubStatus.portAction(ctx, r.param("action", ""), Integer.parseInt(r.param("port", "0")), Integer.parseInt(r.param("off_ms", "2000"))).toString()); } });
+                reg("GET", "/usb/hubs", new Handler() { public void run(HttpServer.Request r, HttpServer.Response s) throws Exception { s.json(200, UsbHubStatus.read(ctx).toString()); } });
+        reg("GET", "/localsocket", new Handler() { public void run(HttpServer.Request r, HttpServer.Response s) throws Exception {
+            s.json(200, LocalSocketProbe.probe(r.param("name", ""), r.param("namespace", "reserved"), r.param("send"), r.param("send_hex"),
+                    Integer.parseInt(r.param("read_ms", "3000"))).toString()); } });
 
         reg("GET", "/settings", new Handler() { public void run(HttpServer.Request r, HttpServer.Response s) throws Exception { settingsGet(r, s); } });
         reg("POST", "/settings", new Handler() { public void run(HttpServer.Request r, HttpServer.Response s) throws Exception { settingsSet(r, s); } });
@@ -942,8 +953,9 @@ public final class Api {
         cmd.append(' ').append(Shell.quote(apk.getAbsolutePath()));
         Shell.Result r = Shell.sh(cmd.toString(), 300_000);
         String out = r.combined().trim();
-        if (out.isEmpty()) out = session;
-        return out;
+        if (out.startsWith("Success")) return out;
+        // pm cannot read the app's cache on the MG4, so its error hides the one that matters.
+        return "session: " + session + "\npm: " + (out.isEmpty() ? "(no output)" : out);
     }
 
     private String packageNameOf(File apk) {
@@ -2017,7 +2029,14 @@ public final class Api {
         new Thread(new Runnable() {
             @Override public void run() {
                 try { Thread.sleep(500); } catch (InterruptedException ignored) { }
-                Shell.sh(m.isEmpty() ? "reboot" : "reboot " + m, 15_000);
+                // On the MG4 the shell `reboot` returns without rebooting; the app holds REBOOT itself.
+                try {
+                    android.os.PowerManager pm = (android.os.PowerManager) ctx.getSystemService(Context.POWER_SERVICE);
+                    pm.reboot(m.isEmpty() ? null : m);
+                } catch (Throwable t) {
+                    Log.w(TAG, "PowerManager.reboot failed (" + t + "); trying the shell");
+                    Shell.sh(m.isEmpty() ? "reboot" : "reboot " + m, 15_000);
+                }
             }
         }).start();
     }

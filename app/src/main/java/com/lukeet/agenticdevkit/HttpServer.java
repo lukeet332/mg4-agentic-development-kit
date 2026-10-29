@@ -58,30 +58,67 @@ public final class HttpServer {
     public long rejected() { return rejected.get(); }
     public String lastError() { return lastError; }
     public int port() { return port; }
-    public boolean running() { return running; }
+    /** Whether the channel is actually accepting: false while it rebinds or after the accept thread died. */
+    public boolean running() { return running && listening; }
+
+    private volatile boolean listening;
+
+    private ServerSocket bindSocket() throws IOException {
+        ServerSocket s = new ServerSocket();
+        s.setReuseAddress(true);
+        s.bind(new InetSocketAddress(bind, port), 64);
+        return s;
+    }
 
     public void start() throws IOException {
-        server = new ServerSocket();
-        server.setReuseAddress(true);
-        server.bind(new InetSocketAddress(bind, port), 64);
+        server = bindSocket();
         running = true;
+        listening = true;
         Thread t = new Thread(new Runnable() {
             @Override public void run() {
                 Log.i(TAG, "HTTP server listening on " + bind + ":" + port);
+                long backoff = 500;
                 while (running) {
                     final Socket s;
                     try {
                         s = server.accept();
+                        backoff = 500;
                     } catch (IOException e) {
-                        if (running) lastError = String.valueOf(e);
+                        if (!running) break;
+                        // Seen on the MG4: accept() failed once around a Wi-Fi change and the thread
+                        // used to exit here, leaving the app "RUNNING" with nothing on the port.
+                        lastError = String.valueOf(e);
+                        listening = false;
+                        Log.w(TAG, "accept failed (" + e + "); rebinding in " + backoff + "ms");
+                        try { server.close(); } catch (IOException ignored) { }
+                        try { Thread.sleep(backoff); } catch (InterruptedException ie) { break; }
+                        backoff = Math.min(backoff * 2, 5_000);
+                        try {
+                            server = bindSocket();
+                            listening = true;
+                            Log.i(TAG, "HTTP server rebound on " + bind + ":" + port);
+                        } catch (IOException be) {
+                            lastError = String.valueOf(be);
+                            Log.w(TAG, "rebind failed: " + be);
+                        }
+                        continue;
+                    } catch (Throwable fatal) {
+                        lastError = String.valueOf(fatal);
+                        Log.e(TAG, "accept thread died", fatal);
                         break;
                     }
-                    pool.execute(new Runnable() {
-                        @Override public void run() {
-                            handleConnection(s);
-                        }
-                    });
+                    try {
+                        pool.execute(new Runnable() {
+                            @Override public void run() {
+                                handleConnection(s);
+                            }
+                        });
+                    } catch (Throwable rejectedExec) {
+                        rejected.incrementAndGet();
+                        try { s.close(); } catch (IOException ignored) { }
+                    }
                 }
+                listening = false;
                 Log.i(TAG, "HTTP server stopped");
             }
         }, "adk-http-accept");

@@ -60,11 +60,13 @@ public final class AdkAccessibilityService extends AccessibilityService {
         super.onServiceConnected();
         instance = this;
         Log.i(TAG, "accessibility service connected");
+        // The system rebinds this after boot, updates and crashes: a second way back for the channel.
+        if (Config.autostart(this) && !AdkService.isRunning()) AdkService.start(this);
     }
 
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
-        // nothing to do: the tree is read on demand
+        // The tree is read on demand; no events are acted on (the app drawer moved to MG4 Apps).
     }
 
     @Override

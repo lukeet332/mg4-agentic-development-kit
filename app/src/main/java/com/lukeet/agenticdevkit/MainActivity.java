@@ -141,6 +141,44 @@ public final class MainActivity extends Activity {
         super.onPause();
     }
 
+    /** Result of the last self-test, shown under the URL. */
+    private volatile String selfTest = "";
+    private volatile boolean selfTesting;
+
+    /**
+     * Calls /health on each of this unit's own addresses. OK here while a laptop cannot connect
+     * means the network is in the way; FAIL means the channel itself is down.
+     */
+    private void runSelfTest(final int port) {
+        if (selfTesting) return;
+        selfTesting = true;
+        new Thread(new Runnable() {
+            @Override public void run() {
+                StringBuilder sb = new StringBuilder("Self-test:");
+                for (String entry : Net.addresses()) {
+                    String addr = entry.substring(entry.indexOf('=') + 1);
+                    long t0 = System.currentTimeMillis();
+                    try {
+                        java.net.HttpURLConnection c = (java.net.HttpURLConnection)
+                                new java.net.URL("http://" + addr + ":" + port + "/health").openConnection();
+                        c.setConnectTimeout(2000);
+                        c.setReadTimeout(2000);
+                        int code = c.getResponseCode();
+                        c.disconnect();
+                        sb.append("  ").append(entry).append(code == 200 ? " OK " : " HTTP " + code + " ")
+                                .append(System.currentTimeMillis() - t0).append("ms");
+                    } catch (Throwable t) {
+                        sb.append("  ").append(entry).append(" FAIL (").append(t.getClass().getSimpleName()).append(')');
+                    }
+                }
+                HttpServer s = AdkService.server();
+                if (s != null && !s.lastError().isEmpty()) sb.append("   ·   last error: ").append(s.lastError());
+                selfTest = sb.toString();
+                selfTesting = false;
+            }
+        }, "adk-selftest").start();
+    }
+
     private void refresh() {
         boolean running = AdkService.isRunning();
         int p = running ? AdkService.runningPort() : Config.port(this);
@@ -148,9 +186,11 @@ public final class MainActivity extends Activity {
         status.setText(running
                 ? "Channel RUNNING on port " + p
                 : "Channel stopped");
-        url.setText(running
+        String base = running
                 ? "http://" + ip + ":" + p + "   (this unit)   ·   uid " + android.os.Process.myUid()
-                : "Start the channel to serve http://" + ip + ":" + p);
+                : "Start the channel to serve http://" + ip + ":" + p;
+        url.setText(base + (selfTest.isEmpty() ? "" : "\n" + selfTest));
+        runSelfTest(p);
         toggle.setText(running ? "Stop channel" : "Start channel");
 
         Pairing.Status st = Pairing.status(this, true);

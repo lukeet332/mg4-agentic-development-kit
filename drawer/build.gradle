@@ -1,0 +1,31 @@
+plugins {
+    id 'com.android.application'
+}
+
+// MG4 Apps: the app drawer, opened from the home screen's CarPlay tile. Split out of ADK.
+android {
+    namespace 'com.lukeet.mg4apps'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.lukeet.mg4apps"
+        minSdk 28
+        targetSdk 28
+        versionCode 1
+        versionName "0.1.0"
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    lint {
+        abortOnError false
+        checkReleaseBuilds false
+    }
+}
+
+dependencies {
+    testImplementation 'junit:junit:4.13.2'
+}

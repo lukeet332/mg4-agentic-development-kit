@@ -1,0 +1,31 @@
+plugins {
+    id 'com.android.application'
+}
+
+// ADK Relay: runs on the phone and bridges the tailnet to ADK on the car's hotspot.
+android {
+    namespace 'com.lukeet.adkrelay'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.lukeet.adkrelay"
+        minSdk 26
+        targetSdk 33
+        versionCode 3
+        versionName "0.1.2"
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    lint {
+        abortOnError false
+        checkReleaseBuilds false
+    }
+}
+
+dependencies {
+    testImplementation 'junit:junit:4.13.2'
+}

@@ -28,6 +28,8 @@ public final class Installer {
 
     private static final String TAG = "ADK";
     private static final String ACTION = "com.lukeet.agenticdevkit.INSTALL_RESULT";
+    /** PackageManager.INSTALL_INTERNAL (hidden). */
+    private static final int INSTALL_INTERNAL = 0x00000010;
 
     private Installer() {}
 
@@ -58,6 +60,14 @@ public final class Installer {
                     Method m = params.getClass().getMethod("setAllowDowngrade", boolean.class);
                     m.invoke(params, true);
                 } catch (Throwable ignored) { }
+            }
+            // The MG4 refuses "non-system apps on internal storage" unless the install says
+            // internal explicitly (what pm install -f does); without it the session never opens.
+            try {
+                java.lang.reflect.Field f = params.getClass().getField("installFlags");
+                f.setInt(params, f.getInt(params) | INSTALL_INTERNAL);
+            } catch (Throwable t) {
+                Log.w(TAG, "could not request an internal install: " + t);
             }
             sessionId = installer.createSession(params);
             session = installer.openSession(sessionId);
